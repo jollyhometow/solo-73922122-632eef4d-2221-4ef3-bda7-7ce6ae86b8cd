@@ -29,6 +29,15 @@ shutdown() {
   STOPPING=1
   echo "[entrypoint] 收到停止信号，终止全部子进程…"
   kill "$WEB_PID" "$ECHO_PID" "$WD_PID" 2>/dev/null
+  # 诊断 trace 监听进程由 Web 进程组派生（start_new_session，自身即组长）；
+  # 用负 PID 整进程组回收，确保“结束回收监听进程，旧事件不进入下次诊断”。
+  # 不依赖 ps/procps（slim 镜像未必提供）。
+  if [ -f /data/diag/monitor.pid ]; then
+    MPID=$(cat /data/diag/monitor.pid 2>/dev/null || true)
+    if [ -n "$MPID" ]; then
+      kill -TERM "-$MPID" 2>/dev/null || kill -TERM "$MPID" 2>/dev/null || true
+    fi
+  fi
 }
 trap shutdown TERM INT
 

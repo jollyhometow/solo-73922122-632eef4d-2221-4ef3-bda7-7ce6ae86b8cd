@@ -26,3 +26,15 @@ INITIAL_PORTS = sorted({WEB_PORT, ECHO_PORT})
 
 MIN_PORT = 1
 MAX_PORT = 65535
+
+# ---- 短时入站诊断（nftables trace）相关配置 ----
+# 单次诊断采集时长（秒）：到期自动回收监听进程并移除 trace 规则
+DIAG_DURATION_SECONDS = float(os.getenv("DIAG_DURATION_SECONDS", "10"))
+# 单次诊断最多关联展示的包数（超出仅计数，不进入结果）
+DIAG_MAX_PACKETS = int(os.getenv("DIAG_MAX_PACKETS", "100"))
+# 监听进程等运行期文件（PID 等）目录
+DIAG_STATE_DIR = os.getenv("DIAG_STATE_DIR", "/data/diag")
+# 独立发包端服务地址（容器网络内主机名 prober）；浏览器经后端代理访问
+PROBER_URL = os.getenv("PROBER_URL", "http://prober:9000")
+# 后端代理发包端请求的超时
+PROBER_TIMEOUT_SECONDS = float(os.getenv("PROBER_TIMEOUT_SECONDS", "12"))

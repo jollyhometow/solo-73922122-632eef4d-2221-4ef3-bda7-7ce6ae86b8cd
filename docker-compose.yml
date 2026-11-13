@@ -6,14 +6,14 @@ services:
     # 仅使用容器自有网络命名空间，不使用 network_mode: host
     cap_add:
       - NET_ADMIN   # 在容器网络命名空间内操作 nftables 所必需
-      - NET_RAW     # nft/排错工具所需（原始套接字）
+      - NET_RAW     # nft/排错工具所需（原始套接字，trace 监听同样需要）
     ports:
       # 浏览器入口：管理网页
       - "8080:8080"
       # 附带的 HTTP 回显服务
       - "8090:8090"
     volumes:
-      # SQLite 持久化：已确认规则与变更单跨容器重启保留
+      # SQLite 持久化：已确认规则、变更单、诊断结果跨容器重启保留
       - port_mgmt_data:/data
     environment:
       WEB_PORT: "8080"
@@ -21,6 +21,12 @@ services:
       CONFIRM_WINDOW_SECONDS: "30"
       NFT_TABLE_NAME: "port_mgmt"
       DB_PATH: "/data/mgmt.db"
+      DIAG_DURATION_SECONDS: "10"
+      DIAG_MAX_PACKETS: "100"
+      # 独立发包端在同一自定义桥接网络中的服务名
+      PROBER_URL: "http://prober:9000"
+    networks:
+      - mgmt_net
     restart: unless-stopped
     # 健康检查走回环接口（回环永远放行），不依赖白名单
     healthcheck:
@@ -29,6 +35,29 @@ services:
       timeout: 5s
       retries: 5
       start_period: 5s
+
+  # 独立来源的本地发包端：独立镜像/代码/网络栈，无 NET_ADMIN/NET_RAW，
+  # 仅向外发起真实 TCP 连接，供诊断页一键触发产生非回环入站 IPv4 TCP 包。
+  prober:
+    build:
+      context: ./prober
+    image: port-mgmt-prober:latest
+    container_name: port-mgmt-prober
+    environment:
+      PROBER_PORT: "9000"
+      TARGET_HOST: "port-mgmt"
+      TARGET_PORTS: "8080,8090,9000"
+      PROBE_ROUNDS: "2"
+    ports:
+      # 也直接发布，便于在宿主上独立 curl 验证（浏览器默认走管理面代理）
+      - "9000:9000"
+    networks:
+      - mgmt_net
+    restart: unless-stopped
+
+networks:
+  mgmt_net:
+    driver: bridge
 
 volumes:
   port_mgmt_data:

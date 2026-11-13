@@ -40,14 +40,33 @@
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
   th { color:var(--muted); font-weight:600; }
-  #banner { padding:12px 16px; border-radius:10px; display:none; font-size:14px; }
-  #banner.info { display:block; background:rgba(59,130,246,.15); border:1px solid #3b82f6; }
-  #banner.ok { display:block; background:rgba(34,197,94,.15); border:1px solid var(--ok); }
-  #banner.err { display:block; background:rgba(239,68,68,.15); border:1px solid var(--err); }
+  #banner, #diagBanner { padding:12px 16px; border-radius:10px; display:none; font-size:14px; margin-top:12px; }
+  #banner.info, #diagBanner.info { display:block; background:rgba(59,130,246,.15); border:1px solid #3b82f6; }
+  #banner.ok, #diagBanner.ok { display:block; background:rgba(34,197,94,.15); border:1px solid var(--ok); }
+  #banner.err, #diagBanner.err { display:block; background:rgba(239,68,68,.15); border:1px solid var(--err); }
   .count { font-size:30px; font-weight:700; color:var(--warn); font-variant-numeric:tabular-nums; }
   .danger-note { border:1px dashed var(--err); border-radius:8px; padding:10px 12px;
                  color:#fca5a5; font-size:13px; margin-top:12px; }
   code { background:#0b1220; padding:1px 6px; border-radius:5px; font-size:12.5px; }
+  .verdict-accept { color:var(--ok); font-weight:700; }
+  .verdict-drop { color:var(--err); font-weight:700; }
+  .verdict-unknown { color:var(--warn); font-weight:700; }
+  .diag-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  @media (max-width:820px){ .diag-grid{grid-template-columns:1fr;} }
+  .diag-table { font-size:12.5px; }
+  .diag-table td, .diag-table th { padding:6px 8px; }
+  .event-chip { display:inline-block; margin:1px 3px 1px 0; padding:1px 7px;
+                border-radius:6px; font-size:11px; background:#0b1220;
+                border:1px solid var(--line); color:var(--muted); }
+  .event-chip.accept { border-color:var(--ok); color:var(--ok); }
+  .event-chip.drop { border-color:var(--err); color:var(--err); }
+  .event-chip.rule { border-color:#475569; color:#cbd5e1; }
+  .diag-summary { display:flex; gap:18px; flex-wrap:wrap; margin:10px 0; font-size:13px; }
+  .diag-summary b { font-size:18px; font-variant-numeric:tabular-nums; }
+  details.events summary { cursor:pointer; color:var(--pri); font-size:12px; }
+  details.events pre { max-height:180px; margin-top:6px; font-size:11.5px; }
+  .tag-undecidable { background:rgba(245,158,11,.18); color:var(--warn);
+                     padding:1px 7px; border-radius:6px; font-size:11px; }
 </style>
 </head>
 <body>
@@ -106,6 +125,31 @@
         <tbody id="changesBody"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
       </table>
     </div>
+  </div>
+
+  <div class="card" id="diagCard">
+    <h2>短时入站诊断（nftables trace，采集 <span id="diagDuration">10</span> 秒，最多 <span id="diagMax">100</span> 包）</h2>
+    <p class="muted">
+      输入<b>源 IPv4</b> 后启动，采集真实<b>非回环入站 IPv4 TCP</b> 包在本专用表的
+      完整 trace 事件，并给出每个包的最终 <span class="verdict-accept">放行</span>/
+      <span class="verdict-drop">丢弃</span> 判定。trace 规则只观察不裁决，不改变白名单语义；
+      诊断期间应用/确认/30 秒自动回退照常，迟到事件按包实际判定时的白名单关联。
+      同期只允许一份诊断。
+    </p>
+    <div class="row">
+      <input id="diagSrcIp" type="text" style="max-width:320px"
+             placeholder="源 IPv4，例如 172.18.0.3" />
+      <button class="btn-pri" id="diagStartBtn">启动 10 秒诊断</button>
+      <button class="btn-ok" id="proberInfoBtn" type="button">读取发包端源 IP</button>
+      <button class="btn-pri" id="proberProbeBtn" type="button" disabled>
+        浏览器触发发包端探测
+      </button>
+    </div>
+    <div id="diagBanner"></div>
+    <div id="diagProgress" style="display:none; margin-top:12px">
+      <div class="muted">诊断进行中，剩余 <b id="diagCountdown">10.0</b> 秒；请在窗口内触发探测或从外部向本网卡发包。</div>
+    </div>
+    <div id="diagResult"></div>
   </div>
 </main>
 
@@ -256,6 +300,205 @@ async function loadConfig() {
 
 loadConfig().then(refresh);
 pollTimer = setInterval(refresh, 1500);
+
+// ===========================================================================
+// 短时入站诊断（nftables trace）
+// ===========================================================================
+let diagPoll = null, diagCountdownTimer = null, lastDiagSessionId = null;
+const d$ = (id) => document.getElementById(id);
+
+function diagBanner(kind, msg) {
+  const el = d$("diagBanner");
+  el.className = kind;  // 复用全局 #banner 的 info/ok/err 样式
+  el.textContent = msg;
+}
+function clearDiagBanner() {
+  const el = d$("diagBanner");
+  el.className = ""; el.textContent = "";
+}
+
+function fmtTime(epoch) {
+  if (epoch == null) return "—";
+  return new Date(epoch * 1000).toLocaleTimeString("zh-CN", { hour12: false }) +
+         "." + String(Math.floor((epoch * 1000) % 1000)).padStart(3, "0");
+}
+
+function renderDiagResult(session) {
+  const box = d$("diagResult");
+  if (!session) { box.innerHTML = '<p class="muted" style="margin-top:12px">尚无诊断记录。</p>'; return; }
+  const r = session.result;
+  const statusMap = {
+    running: ["s-warn", "采集中"], finalizing: ["s-warn", "回收中"],
+    done: ["s-ok", "已完成"], error: ["s-err", "采集故障/无法判定"],
+  };
+  const [scls, stxt] = statusMap[session.status] || ["s-warn", session.status];
+
+  if (!r) {
+    box.innerHTML = `<p class="muted" style="margin-top:12px">
+      会话 #${session.id}（源 ${session.source_ip}）状态：
+      <span class="pill ${scls}">${stxt}</span>
+      ${session.error_detail ? `<br>说明：${session.error_detail}` : ""}</p>`;
+    return;
+  }
+
+  const acceptN = r.packets.filter(p => p.verdict === "accept").length;
+  const dropN = r.packets.filter(p => p.verdict === "drop").length;
+  const unknownN = r.packets.filter(p => p.verdict == null).length;
+
+  const versionsHtml = (r.whitelist_versions || []).map(v =>
+    `<div class="muted" style="font-size:12px">${fmtTime(v.applied_at)}
+       白名单 [${(v.whitelist || []).join(", ")}] <i>${v.reason}</i></div>`).join("");
+
+  const rows = r.packets.map(p => {
+    const vcls = p.verdict === "accept" ? "verdict-accept"
+               : p.verdict === "drop" ? "verdict-drop" : "verdict-unknown";
+    const chips = (p.events || []).map(ev => {
+      let cls = "rule", txt = ev.subtype || ev.kind;
+      if (ev.verdict === "accept") { cls = "accept"; txt = "accept"; }
+      else if (ev.verdict === "drop") { cls = "drop"; txt = "drop"; }
+      else if (ev.kind === "packet") { txt = "packet"; }
+      return `<span class="event-chip ${cls}" title="seq ${ev.seq}">${txt}${ev.handle != null ? " h" + ev.handle : ""}</span>`;
+    }).join("");
+    const wl = p.whitelist_at_verdict == null ? "—" : "[" + p.whitelist_at_verdict.join(", ") + "]";
+    return `<tr>
+      <td>${p.index}</td>
+      <td>${p.src_ip ?? "—"}:${p.sport ?? "?"} → ${p.dst_ip ?? "—"}:${p.dport ?? "?"}<br>
+          <span class="muted">${p.iface ?? ""} · trace ${p.trace_id}</span></td>
+      <td class="${vcls}">${p.verdict_label}</td>
+      <td class="muted">${wl}</td>
+      <td>${p.decidable ? "" : '<span class="tag-undecidable">无法判定</span> '}${p.note || ""}
+        <details class="events"><summary>${(p.events || []).length} 个交错事件</summary>
+          <div>${chips}</div>
+          ${p.events && p.events.some(e => e.rule_expr) ? `<pre>${p.events.filter(e=>e.rule_expr).map(e=>"h"+(e.handle??"?")+" "+e.rule_expr).join("\n")}</pre>` : ""}
+        </details>
+      </td></tr>`;
+  }).join("");
+
+  box.innerHTML = `
+    <div style="margin-top:14px">
+      <div>会话 <b>#${r.session_id}</b> · 源 <code>${r.source_ip}</code>
+        <span class="pill ${scls}">${stxt}</span>
+        <span class="muted">${fmtTime(r.started_at)} → ${fmtTime(r.finalized_at)}</span></div>
+      ${r.error_detail ? `<div class="err" style="padding:10px 14px;border-radius:8px;margin:8px 0;background:rgba(239,68,68,.15);border:1px solid var(--err)">${r.error_detail}</div>` : ""}
+      <div class="diag-summary">
+        <span>纳入包 <b>${r.packets_captured}</b> / ${r.max_packets}</span>
+        <span class="verdict-accept">放行 <b>${acceptN}</b></span>
+        <span class="verdict-drop">丢弃 <b>${dropN}</b></span>
+        <span class="verdict-unknown">无法判定 <b>${unknownN}</b></span>
+        <span>超上限未纳入 <b>${r.packets_dropped_cap}</b></span>
+        <span class="muted">trace 事件 ${r.events_seen}</span>
+      </div>
+      <details ${r.whitelist_versions && r.whitelist_versions.length ? "" : "style='display:none'"}>
+        <summary class="muted" style="cursor:pointer">诊断期间规则版本时间线（迟到事件按实际判定时刻对齐）</summary>
+        <div style="margin:6px 0">${versionsHtml}</div>
+      </details>
+      <div style="overflow:auto">
+      <table class="diag-table">
+        <thead><tr><th>#</th><th>源 → 目标（IP/端口）</th><th>本专用表最终结果</th>
+          <th>判定时白名单</th><th>说明 / 交错事件</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="5" class="muted">采集窗口内没有匹配的入站 IPv4 TCP 包</td></tr>'}</tbody>
+      </table>
+      </div>
+    </div>`;
+}
+
+async function refreshDiag() {
+  try {
+    const r = await fetch("/api/diag/active", { cache: "no-store" });
+    const data = await r.json();
+    const active = data.active;
+    if (active) {
+      lastDiagSessionId = active.id;
+      d$("diagStartBtn").disabled = true;
+      d$("proberProbeBtn").disabled = false;
+      d$("diagProgress").style.display = "block";
+      d$("diagCountdown").textContent = active.remaining_seconds.toFixed(1);
+      if (!diagCountdownTimer) {
+        diagCountdownTimer = setInterval(() => {
+          const el = d$("diagCountdown");
+          if (el) el.textContent = Math.max(0, active.ends_at - Date.now() / 1000).toFixed(1);
+        }, 100);
+      }
+      diagBanner("info", `诊断 #${active.id} 采集中（源 ${active.source_ip}），结束后自动出结果`);
+    } else {
+      d$("diagStartBtn").disabled = false;
+      d$("proberProbeBtn").disabled = true;
+      d$("diagProgress").style.display = "none";
+      if (diagCountdownTimer) { clearInterval(diagCountdownTimer); diagCountdownTimer = null; }
+      if (diagPoll) { clearInterval(diagPoll); diagPoll = null; }
+      clearDiagBanner();
+      if (lastDiagSessionId != null) {
+        const sr = await fetch(`/api/diag/session?session_id=${lastDiagSessionId}`);
+        const sd = await sr.json();
+        if (sd.exists) renderDiagResult(sd.session);
+        lastDiagSessionId = null;
+      }
+    }
+  } catch (e) {
+    // 诊断页自身请求失败不影响主页面
+  }
+}
+
+d$("diagStartBtn").onclick = async () => {
+  const source_ip = d$("diagSrcIp").value.trim();
+  if (!source_ip) { diagBanner("err", "请先输入源 IPv4（可用“读取发包端源 IP”自动填入）"); return; }
+  d$("diagStartBtn").disabled = true;
+  try {
+    const r = await fetch("/api/diag/start", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_ip }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || "启动失败");
+    lastDiagSessionId = data.session_id;
+    diagBanner("ok", `诊断 #${data.session_id} 已启动，采集 ${data.duration_seconds} 秒`);
+    if (!diagPoll) diagPoll = setInterval(refreshDiag, 500);
+    refreshDiag();
+  } catch (e) {
+    diagBanner("err", "诊断启动失败：" + e.message);
+    d$("diagStartBtn").disabled = false;
+  }
+};
+
+d$("proberInfoBtn").onclick = async () => {
+  try {
+    const r = await fetch("/api/prober/info", { method: "POST" });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || "发包端不可达");
+    const ips = data.source_ips || [];
+    if (!ips.length) throw new Error("发包端未报告任何非回环 IPv4");
+    d$("diagSrcIp").value = ips[0];
+    diagBanner("ok", `已填入独立发包端源 IPv4：${ips.join(", ")}（默认探测目标 ${data.default_target_host}）`);
+  } catch (e) {
+    diagBanner("err", "读取发包端失败：" + e.message);
+  }
+};
+
+d$("proberProbeBtn").onclick = async () => {
+  try {
+    const r = await fetch("/api/prober/probe", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || "探测失败");
+    const n = (data.attempts || []).length;
+    diagBanner("info", `发包端已发出 ${n} 个真实 TCP 连接（新临时源端口），trace 将按包记录判定`);
+  } catch (e) {
+    diagBanner("err", "触发探测失败：" + e.message);
+  }
+};
+
+(async function initDiag() {
+  try {
+    const cfg = await (await fetch("/api/diag/config")).json();
+    d$("diagDuration").textContent = cfg.duration_seconds;
+    d$("diagMax").textContent = cfg.max_packets;
+  } catch (e) { /* 用默认值 */ }
+  await refreshDiag();
+  // 页面常驻低频轮询，保证重启浏览器后仍能看到进行中的诊断
+  diagPoll = setInterval(refreshDiag, 1000);
+})();
 </script>
 </body>
 </html>

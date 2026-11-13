@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import db
-import nft
+import nft  # noqa: F401  # 保留适配层引用（能力检查等）
+import ruleset
 from config import CONFIRM_WINDOW_SECONDS
 from db import FAILED, PENDING
 
@@ -79,8 +80,15 @@ def apply_change(requested_ports: list[int]) -> ApplyResult:
                 "存在待确认的变更（数据库并发约束），请先确认或等待其超时回退"
             ) from exc
         try:
-            # 3. 原子生效；nft 批量事务失败时内核保留旧规则
-            nft.apply_ruleset(ports)
+            # 3. 原子生效；nft 批量事务失败时内核保留旧规则。
+            # 经统一协调层写入：诊断期间会自动保留 trace 规则并记录规则版本，
+            # 不覆盖任何新白名单，也不改变确认窗口语义。
+            active_diag = db.get_active_diag_session()
+            ruleset.write_ruleset(
+                ports,
+                reason=f"apply change #{change_id}",
+                diag_session_id=active_diag["id"] if active_diag else None,
+            )
         except Exception as exc:  # NftError 及其子类
             db.mark_change_status(change_id, FAILED, detail=f"应用失败，旧规则保留: {exc}")
             raise ChangeError(f"防火墙应用失败，已保留旧规则: {exc}") from exc
@@ -129,7 +137,12 @@ def confirm_change(change_id: int) -> dict[str, Any]:
     db.set_confirmed_ports(new_ports)  # 持久化新的已确认规则
     # 竞争兜底：若看护进程在截止边界已把 nft 回退到旧规则，这里把规则
     # 重新固化为已确认的新白名单，保证数据库状态与 nft 始终一致
-    nft.apply_ruleset(new_ports)
+    active_diag = db.get_active_diag_session()
+    ruleset.write_ruleset(
+        new_ports,
+        reason=f"confirm change #{change_id}",
+        diag_session_id=active_diag["id"] if active_diag else None,
+    )
     return {
         "change_id": change_id,
         "confirmed_ports": new_ports,
@@ -151,16 +164,27 @@ def rollback_expired() -> list[int]:
 
     change_id = pending["id"]
     previous_ports = json.loads(pending["previous_ports"])
-    # 恢复旧规则（原子批量；失败则保留现状并抛错，下个轮询周期重试）
-    nft.apply_ruleset(previous_ports)
+    # 恢复旧规则（原子批量；失败则保留现状并抛错，下个轮询周期重试）。
+    # 经统一协调层写入：若诊断正在进行，trace 规则随事务保留，回退本身
+    # 的 30 秒期限与触发条件完全不变。
+    active_diag = db.get_active_diag_session()
+    ruleset.write_ruleset(
+        previous_ports,
+        reason=f"rollback expired change #{change_id}",
+        diag_session_id=active_diag["id"] if active_diag else None,
+    )
 
     detail = f"超过 {CONFIRM_WINDOW_SECONDS:.0f}s 未确认，已自动回退到旧白名单"
-    won = db.mark_expired_if_pending(change_id, now, detail)
+    won = db.mark_expired_if_pending(change_id, time.time(), detail)
     if not won:
         # 竞争落败：确认路径已赢得状态机并写入新的已确认基线，
         # 放弃回退，把 nft 恢复为当前已确认规则
         current = db.get_confirmed_ports() or previous_ports
-        nft.apply_ruleset(current)
+        ruleset.write_ruleset(
+            current,
+            reason=f"confirm won race for change #{change_id}",
+            diag_session_id=active_diag["id"] if active_diag else None,
+        )
         return []
     return [change_id]
 
